@@ -6,10 +6,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
+
+# Чтобы работало с Windows embeddable Python (игнорирует PYTHONPATH)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from telethon import TelegramClient, events
 from telethon.tl.custom.message import Message
@@ -252,6 +257,10 @@ async def handle_message(client: TelegramClient, message: Message, source_entity
 
 
 async def resolve_sources(client: TelegramClient) -> list:
+    from telethon import utils as tg_utils
+    from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
+    from telethon.tl.types import Channel
+
     if not config.SOURCE_CHATS:
         dialogs = []
         async for d in client.iter_dialogs():
@@ -260,14 +269,83 @@ async def resolve_sources(client: TelegramClient) -> list:
         return dialogs
 
     entities = []
+    seen_ids: set[int] = set()
+
+    async def add_entity(entity, label: str) -> None:
+        pid = tg_utils.get_peer_id(entity)
+        if pid in seen_ids:
+            return
+        seen_ids.add(pid)
+        entities.append(entity)
+        log.info("Источник (%s): %s [peer=%s]", label, chat_title(entity), pid)
+
     for ref in config.SOURCE_CHATS:
         try:
             entity = await client.get_entity(ref)
-            entities.append(entity)
-            log.info("Источник: %s", chat_title(entity))
+            if isinstance(entity, Channel):
+                try:
+                    await client(JoinChannelRequest(entity))
+                    log.info("Подписка/вход: %s", chat_title(entity))
+                except Exception as e:
+                    log.warning("Join %s: %s", ref, e)
+            await add_entity(entity, ref)
+
+            # Если это канал с группой обсуждения — слушаем и её (туда пишут люди)
+            if isinstance(entity, Channel):
+                try:
+                    full = await client(GetFullChannelRequest(entity))
+                    linked_id = getattr(full.full_chat, "linked_chat_id", None)
+                    if linked_id:
+                        linked = await client.get_entity(linked_id)
+                        await add_entity(linked, f"discussion:{ref}")
+                except Exception as e:
+                    log.warning("linked chat для %s: %s", ref, e)
         except Exception as e:
             log.error("Не удалось открыть %s: %s", ref, e)
     return entities
+
+
+async def poll_new_messages(client: TelegramClient, sources: list) -> None:
+    """Надёжный polling: events иногда не приходят на user-session."""
+    from telethon import utils as tg_utils
+
+    last_ids: dict[int, int] = {}
+    for entity in sources:
+        pid = tg_utils.get_peer_id(entity)
+        try:
+            async for msg in client.iter_messages(entity, limit=1):
+                last_ids[pid] = msg.id
+                break
+            else:
+                last_ids[pid] = 0
+        except Exception as e:
+            log.warning("poll init %s: %s", chat_title(entity), e)
+            last_ids[pid] = 0
+
+    log.info("Polling каждые 5 сек по %d чатам", len(sources))
+    while True:
+        for entity in sources:
+            pid = tg_utils.get_peer_id(entity)
+            min_id = last_ids.get(pid, 0)
+            try:
+                new_msgs = []
+                async for msg in client.iter_messages(entity, min_id=min_id, reverse=True):
+                    if msg.id <= min_id:
+                        continue
+                    new_msgs.append(msg)
+                for msg in new_msgs:
+                    last_ids[pid] = max(last_ids.get(pid, 0), msg.id)
+                    text = msg.text or msg.message or ""
+                    log.info(
+                        "POLL %s | id=%s | %s",
+                        chat_title(entity),
+                        msg.id,
+                        (text or "(без текста)")[:120],
+                    )
+                    await handle_message(client, msg, source_entity=entity)
+            except Exception as e:
+                log.warning("poll %s: %s", chat_title(entity), e)
+        await asyncio.sleep(5)
 
 
 async def scan_history(client: TelegramClient, sources: list) -> None:
@@ -321,15 +399,32 @@ async def main() -> None:
         await client.disconnect()
         return
 
-    chats_filter = sources if config.SOURCE_CHATS else None
+    from telethon import utils as tg_utils
 
-    @client.on(events.NewMessage(chats=chats_filter))
+    source_ids = {tg_utils.get_peer_id(e) for e in sources}
+    log.info("ID источников для live: %s", ", ".join(str(i) for i in source_ids) or "все")
+
+    @client.on(events.NewMessage)
     async def on_new_message(event: events.NewMessage.Event):
         chat = await event.get_chat()
+        peer_id = tg_utils.get_peer_id(chat)
+        if source_ids and peer_id not in source_ids:
+            return
+        text = event.message.text or event.message.message or ""
+        log.info(
+            "EVENT %s | peer=%s | %s",
+            chat_title(chat),
+            peer_id,
+            (text or "(без текста)")[:120],
+        )
         await handle_message(client, event.message, source_entity=chat)
 
-    log.info("Слушаю новые сообщения... (Ctrl+C для выхода)")
-    await client.run_until_disconnected()
+    log.info("Слушаю новые сообщения (events + polling)... Ctrl+C выход")
+    log.info("Пиши тест в @certification_rus или в группе обсуждения канала")
+    await asyncio.gather(
+        poll_new_messages(client, sources),
+        client.run_until_disconnected(),
+    )
 
 
 if __name__ == "__main__":
