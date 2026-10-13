@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram keyword parser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-parser
+ExecStart=/opt/tg-parser/.venv/bin/python /opt/tg-parser/parser.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
